@@ -19,6 +19,7 @@ import { fileURLToPath } from 'url';
 import { load as yamlLoad } from 'js-yaml';
 import { resolveColumns, parseTrackerRow, normalizeVia } from './tracker-parse.mjs';
 import { getCareerOpsRoot } from './path-resolver.mjs';
+import { flagValue, validateFlags } from './lib/cli-flags.mjs';
 
 const CAREER_OPS = getCareerOpsRoot();
 const APPS_FILE = existsSync(join(CAREER_OPS, 'data/applications.md'))
@@ -60,22 +61,47 @@ const MACHINE_SUMMARY_FIELDS = new Set([
 
 // --- CLI args ---
 const args = process.argv.slice(2);
+
+const KNOWN_FLAGS = ['--summary', '--min-threshold', '--min-vendor-n', '--self-test', '--help', '-h'];
+const VALUE_FLAGS = ['--min-threshold', '--min-vendor-n'];
+const USAGE = `Usage:
+  node analyze-patterns.mjs                     # JSON to stdout
+  node analyze-patterns.mjs --summary            # human-readable table
+  node analyze-patterns.mjs --min-threshold <N>  # min applications beyond "Evaluated" before patterns are reported (default 5)
+  node analyze-patterns.mjs --min-vendor-n <N>   # min per-vendor sample before a channel-yield claim fires (default 8)
+  node analyze-patterns.mjs --self-test
+  node analyze-patterns.mjs --help|-h             # show this message`;
+
+// Unknown/mistyped flags (e.g. --min-threshhold) used to be silently ignored,
+// and an unusable --min-threshold/--min-vendor-n value silently fell back to
+// the default instead of erroring — the same failure class #2982 fixed for
+// four other CLIs. exitCode: 2 matches this issue's (#3113) acceptance
+// criteria; it does not change the exit code of any other validateFlags caller.
+validateFlags(args, KNOWN_FLAGS, USAGE, { valueFlags: VALUE_FLAGS, requireOperand: true, exitCode: 2 });
+
 const summaryMode = args.includes('--summary');
-const minThresholdIdx = args.indexOf('--min-threshold');
-const MIN_THRESHOLD = minThresholdIdx !== -1 && args[minThresholdIdx + 1] !== undefined
-  ? (Number.isNaN(parseInt(args[minThresholdIdx + 1])) ? 5 : parseInt(args[minThresholdIdx + 1]))
-  : 5;
+
+// Strict, not fallback: unlike safeIntFlag (used by process-quality.mjs's own
+// --min-threshold, #2982), an unusable value here is a usage error, not a
+// silent substitution — that silent substitution is exactly what #3113 reports.
+function requireIntFlag(flag, { min, fallback }) {
+  const raw = flagValue(args, flag);
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(n) || n < min) {
+    console.error(`Error: ${flag} requires an integer >= ${min}, got "${raw}"`);
+    process.exit(2);
+  }
+  return n;
+}
+
+const MIN_THRESHOLD = requireIntFlag('--min-threshold', { min: 0, fallback: 5 });
 
 // Minimum per-vendor sample before a channel-yield recommendation fires. Kept
 // modest (small trackers) but high enough that one unlucky bucket isn't a claim.
-const minVendorNIdx = args.indexOf('--min-vendor-n');
-const MIN_VENDOR_N = (() => {
-  if (minVendorNIdx === -1 || args[minVendorNIdx + 1] === undefined) return 8;
-  const n = parseInt(args[minVendorNIdx + 1], 10);
-  // Reject 0/negative: a floor of 0 makes sufficientSample always true and
-  // silently defeats the "don't claim on noise" guard the whole feature rests on.
-  return Number.isNaN(n) || n < 1 ? 8 : n;
-})();
+// Floor is 1, not 0: a floor of 0 makes sufficientSample always true and
+// silently defeats the "don't claim on noise" guard the whole feature rests on.
+const MIN_VENDOR_N = requireIntFlag('--min-vendor-n', { min: 1, fallback: 8 });
 
 // --- Status normalization (mirrors verify-pipeline.mjs) ---
 const ALIASES = {
