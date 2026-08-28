@@ -9,7 +9,66 @@ console.log('\nProvider — workday');
 try {
   const workdayModule = await import(pathToFileURL(join(ROOT, 'providers/workday.mjs')).href);
   const workday = workdayModule.default;
-  const { parseWorkdayResponse } = workdayModule;
+  const { parseWorkdayResponse, workdayDedupKey } = workdayModule;
+
+  // dedupKey (#3439) — one requisition served under several sites of the same
+  // tenant must collapse to one key; different tenants/instances must not.
+  if (workday.dedupKey === workdayDedupKey) {
+    pass('workday.dedupKey is wired to the exported workdayDedupKey helper');
+  } else {
+    fail('workday.dedupKey is not the exported workdayDedupKey helper');
+  }
+
+  const crossSiteA = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR00123' });
+  const crossSiteB = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/Careers/job/Remote/Staff-Engineer_JR00123' });
+  if (crossSiteA && crossSiteA === crossSiteB) {
+    pass('workdayDedupKey() collapses the same requisition served under two sites of one tenant');
+  } else {
+    fail(`workdayDedupKey() cross-site collapse failed: ${JSON.stringify({ crossSiteA, crossSiteB })}`);
+  }
+
+  const tenantA = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR00123' });
+  const tenantB = workdayDedupKey({ url: 'https://other.wd5.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR00123' });
+  if (tenantA && tenantB && tenantA !== tenantB) {
+    pass('workdayDedupKey() scopes by tenant — an identical requisition ID string on a different tenant does not collapse');
+  } else {
+    fail(`workdayDedupKey() must not collapse across tenants: ${JSON.stringify({ tenantA, tenantB })}`);
+  }
+
+  const instanceA = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR00123' });
+  const instanceB = workdayDedupKey({ url: 'https://acme.wd1.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR00123' });
+  if (instanceA && instanceB && instanceA !== instanceB) {
+    pass('workdayDedupKey() scopes by instance too — same tenant name, different wd instance, does not collapse');
+  } else {
+    fail(`workdayDedupKey() must not collapse across instances: ${JSON.stringify({ instanceA, instanceB })}`);
+  }
+
+  const multiUnderscoreA = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR_2024_00123' });
+  const multiUnderscoreB = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/Careers/job/Remote/Staff-Engineer_JR_2024_00123' });
+  if (multiUnderscoreA === 'workday:acme.wd5.myworkdayjobs.com:jr_2024_00123' && multiUnderscoreA === multiUnderscoreB) {
+    pass('workdayDedupKey() keeps a multi-underscore requisition ID intact (splits on the FIRST underscore only)');
+  } else {
+    fail(`workdayDedupKey() mishandled a multi-underscore requisition ID: ${JSON.stringify({ multiUnderscoreA, multiUnderscoreB })}`);
+  }
+
+  const localeSegment = workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/en-US/External/job/Remote-Germany/Staff-Engineer_JR00123' });
+  if (localeSegment === 'workday:acme.wd5.myworkdayjobs.com:jr00123') {
+    pass('workdayDedupKey() is unaffected by extra path segments (locale, location) before the last one');
+  } else {
+    fail(`workdayDedupKey() with a locale segment returned ${JSON.stringify(localeSegment)}`);
+  }
+
+  if (workdayDedupKey({ url: 'https://acme.wd5.myworkdayjobs.com/External/job/Remote/StaffEngineer' }) === null) {
+    pass('workdayDedupKey() returns null when the last path segment has no requisition-ID separator');
+  } else {
+    fail('workdayDedupKey() should return null when it cannot find a requisition ID');
+  }
+
+  if (workdayDedupKey({ url: 'not a url' }) === null && workdayDedupKey({}) === null && workdayDedupKey(null) === null) {
+    pass('workdayDedupKey() returns null (not throws) for a malformed/missing url');
+  } else {
+    fail('workdayDedupKey() should return null, not throw, for malformed input');
+  }
 
   // Shared mock ctx shape for workday.fetch() calls below — only fetchJson varies per test.
   // sleep is a no-op so retry-backoff delays don't slow the test suite down.

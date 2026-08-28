@@ -128,6 +128,38 @@ function locationFromPath(externalPath) {
   return segment.replace(/-/g, ' ');
 }
 
+// A Workday tenant can publish the same requisition under several sites
+// (careers page, Indeed feed, Glassdoor feed, ...) — same tenant/instance
+// host, different `site` path segment, so normalizeUrlForDedup's per-URL
+// comparison never recognizes them as the same posting (#3439). The
+// requisition ID is the authoritative identifier, and it's the last
+// underscore-delimited segment of the URL's last path component: Workday's
+// own title slug uses HYPHENS for spaces ("Staff-Engineer"), never
+// underscores, so the FIRST underscore in that segment is always the
+// title/requisition-ID boundary — everything after it is the requisition ID
+// even when the ID itself contains further underscores (e.g. "JR_2024_00123").
+//
+// Scoped by hostname, not just the tenant subdomain: hostname already
+// encodes both tenant AND instance (tenant.instance.myworkdayjobs.com), and
+// two different tenants/instances coincidentally sharing a requisition ID
+// string must never collapse to the same key.
+export function workdayDedupKey(job) {
+  let parsed;
+  try {
+    parsed = new URL(job?.url);
+  } catch {
+    return null;
+  }
+  const segments = parsed.pathname.split('/').filter(Boolean);
+  const lastSegment = segments[segments.length - 1];
+  if (!lastSegment) return null;
+  const underscoreIdx = lastSegment.indexOf('_');
+  if (underscoreIdx === -1) return null; // no title/requisition-ID separator — nothing to key on
+  const reqId = lastSegment.slice(underscoreIdx + 1).toLowerCase();
+  if (!reqId) return null;
+  return `workday:${parsed.hostname.toLowerCase()}:${reqId}`;
+}
+
 export function parseWorkdayResponse(json, entry) {
   const ep = resolveEndpoint(entry);
   const jobBase = ep?.jobBase || '';
@@ -155,6 +187,8 @@ export default {
     const ep = resolveEndpoint(entry);
     return ep ? { url: ep.api } : null;
   },
+
+  dedupKey: workdayDedupKey,
 
   /**
    * Fetch all job postings for a Workday-backed entry, paginating through
