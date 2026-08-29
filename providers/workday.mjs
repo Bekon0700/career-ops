@@ -143,6 +143,13 @@ function locationFromPath(externalPath) {
 // encodes both tenant AND instance (tenant.instance.myworkdayjobs.com), and
 // two different tenants/instances coincidentally sharing a requisition ID
 // string must never collapse to the same key.
+//
+// Workday appends its own `-2` / `-3` disambiguator to the requisition tail
+// when the SAME requisition is the one being republished on a second or
+// third site (credit: ronanime-arch, PR #3446 — measured live, one
+// requisition filled 3 of 7 results in a sweep). Left un-stripped, that
+// disambiguator defeats the entire point of this function: the three sites'
+// URLs would each key to a different requisition ID and never collapse.
 export function workdayDedupKey(job) {
   let parsed;
   try {
@@ -155,7 +162,7 @@ export function workdayDedupKey(job) {
   if (!lastSegment) return null;
   const underscoreIdx = lastSegment.indexOf('_');
   if (underscoreIdx === -1) return null; // no title/requisition-ID separator — nothing to key on
-  const reqId = lastSegment.slice(underscoreIdx + 1).toLowerCase();
+  const reqId = lastSegment.slice(underscoreIdx + 1).toLowerCase().replace(/-\d+$/, '');
   if (!reqId) return null;
   return `workday:${parsed.hostname.toLowerCase()}:${reqId}`;
 }

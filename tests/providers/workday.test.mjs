@@ -70,6 +70,86 @@ try {
     fail('workdayDedupKey() should return null, not throw, for malformed input');
   }
 
+  // The 5 cases below are adapted from ronanime-arch's independent PR #3446
+  // implementation (same feature, different call sites — theirs covers
+  // runSeedScan + the main sweep, not checkpoint-resume reseed). Their case
+  // that caught a real bug here: Workday appends its own `-2`/`-3`
+  // disambiguator to the requisition tail when a requisition is republished
+  // on a second/third site, which this function didn't strip until now.
+
+  // Real-world case from their commit message (measured 2026-08-13): one
+  // requisition (agf R11312) served on three sites, Indeed/Glassdoor URLs
+  // carrying the `-2`/`-3` disambiguator Workday adds for the extra copies.
+  {
+    const base = 'https://agf.wd3.myworkdayjobs.com';
+    const keys = [
+      `${base}/agf_careers/job/Toronto-ON/Executive-Assistant--CIO---CFO_R11312`,
+      `${base}/indeed_careers/job/Toronto-ON/Executive-Assistant--CIO---CFO_R11312-3`,
+      `${base}/glassdoor_careers/job/Toronto-ON/Executive-Assistant--CIO---CFO_R11312-2`,
+    ].map(url => workdayDedupKey({ url }));
+    if (new Set(keys).size === 1 && keys[0]) {
+      pass('workdayDedupKey() strips the Indeed/Glassdoor `-N` disambiguator and collapses all 3 sites (ronanime-arch, PR #3446)');
+    } else {
+      fail(`workdayDedupKey() did not collapse the disambiguated sites: ${JSON.stringify(keys)}`);
+    }
+  }
+
+  // A multi-underscore requisition ID (R26_05710) carrying a disambiguator
+  // must keep the ID intact and still have the disambiguator stripped —
+  // not truncate to "05710" (first-underscore split) and not leave a
+  // dangling "-1" (missing disambiguator strip).
+  {
+    const k = workdayDedupKey({ url: 'https://agecare.wd10.myworkdayjobs.com/agecare_careers_external/job/Brooks-Alberta-Canada/Scheduler--Casual_R26_05710-1' });
+    if (k === 'workday:agecare.wd10.myworkdayjobs.com:r26_05710') {
+      pass('workdayDedupKey() keeps a multi-underscore requisition ID intact AND strips its disambiguator (ronanime-arch, PR #3446)');
+    } else {
+      fail(`workdayDedupKey() mishandled the multi-underscore + disambiguator case: ${k}`);
+    }
+  }
+
+  // Two different tenants reusing the same bare requisition number must not
+  // collapse — direct coverage of ronanime-arch's tenant-scoping case
+  // (already covered above by the JR00123 tenant/instance fixtures; kept as
+  // its own assertion since it's the literal case from their PR).
+  {
+    const a = workdayDedupKey({ url: 'https://one.wd3.myworkdayjobs.com/careers/job/Toronto/Analyst_R100' });
+    const b = workdayDedupKey({ url: 'https://two.wd3.myworkdayjobs.com/careers/job/Toronto/Analyst_R100' });
+    if (a && b && a !== b) {
+      pass('workdayDedupKey() does not collapse two tenants reusing the same requisition number (ronanime-arch, PR #3446)');
+    } else {
+      fail(`workdayDedupKey() incorrectly collapsed two tenants: ${JSON.stringify({ a, b })}`);
+    }
+  }
+
+  // No requisition-looking tail in the path — falls back rather than risk
+  // collapsing two different openings that happen to share a bare title.
+  if (workdayDedupKey({ url: 'https://acme.wd3.myworkdayjobs.com/careers/job/Toronto/Warehouse-Supervisor' }) === null) {
+    pass('workdayDedupKey() returns null for a bare title with no requisition ID (ronanime-arch, PR #3446)');
+  } else {
+    fail('workdayDedupKey() should return null for a bare-title path with no requisition ID');
+  }
+
+  // Non-Workday URLs are not this function's business — it happens to
+  // return null for these today because none of their last path segments
+  // contain an underscore, not because of an explicit hostname check (unlike
+  // ronanime-arch's version, which checks the hostname ends in
+  // .myworkdayjobs.com explicitly). Documented as a known gap, not fixed
+  // here: workday.dedupKey is only ever invoked on jobs this provider itself
+  // fetched, so a non-Workday URL reaching it would already be a bug
+  // elsewhere.
+  {
+    const bad = [
+      workdayDedupKey({ url: 'https://jobs.lever.co/achievers/abc-123' }),
+      workdayDedupKey({ url: 'not a url' }),
+      workdayDedupKey({}),
+    ];
+    if (bad.every(k => k === null)) {
+      pass('workdayDedupKey() returns null for non-Workday and malformed input (ronanime-arch, PR #3446)');
+    } else {
+      fail(`workdayDedupKey() expected all null for non-Workday/malformed input, got: ${JSON.stringify(bad)}`);
+    }
+  }
+
   // Shared mock ctx shape for workday.fetch() calls below — only fetchJson varies per test.
   // sleep is a no-op so retry-backoff delays don't slow the test suite down.
   const mkWorkdayCtx = (fetchJson, extra = {}) => ({
