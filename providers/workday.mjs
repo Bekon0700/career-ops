@@ -157,6 +157,11 @@ export function workdayDedupKey(job) {
   } catch {
     return null;
   }
+  // Non-Workday URLs must fall back to normalized-URL dedup, not produce a
+  // bogus workday: key just because their last path segment happens to
+  // contain an underscore (e.g. a Lever/Greenhouse job whose slug does) —
+  // reported by CodeRabbit against this exact function.
+  if (!parsed.hostname.toLowerCase().endsWith('.myworkdayjobs.com')) return null;
   const segments = parsed.pathname.split('/').filter(Boolean);
   const lastSegment = segments[segments.length - 1];
   if (!lastSegment) return null;

@@ -129,14 +129,12 @@ try {
     fail('workdayDedupKey() should return null for a bare-title path with no requisition ID');
   }
 
-  // Non-Workday URLs are not this function's business — it happens to
-  // return null for these today because none of their last path segments
-  // contain an underscore, not because of an explicit hostname check (unlike
-  // ronanime-arch's version, which checks the hostname ends in
-  // .myworkdayjobs.com explicitly). Documented as a known gap, not fixed
-  // here: workday.dedupKey is only ever invoked on jobs this provider itself
-  // fetched, so a non-Workday URL reaching it would already be a bug
-  // elsewhere.
+  // Non-Workday URLs are rejected by an explicit hostname check now (fixed
+  // per CodeRabbit against this function): previously these returned null
+  // only by coincidence, because their last path segment had no underscore.
+  // The Lever/Greenhouse cases below have an underscore in that segment
+  // specifically to prove the hostname check itself is doing the work, not
+  // the coincidence.
   {
     const bad = [
       workdayDedupKey({ url: 'https://jobs.lever.co/achievers/abc-123' }),
@@ -147,6 +145,19 @@ try {
       pass('workdayDedupKey() returns null for non-Workday and malformed input (ronanime-arch, PR #3446)');
     } else {
       fail(`workdayDedupKey() expected all null for non-Workday/malformed input, got: ${JSON.stringify(bad)}`);
+    }
+  }
+
+  {
+    const spoofed = [
+      workdayDedupKey({ url: 'https://jobs.lever.co/acme/Role_R100' }),           // underscore in last segment, non-Workday host
+      workdayDedupKey({ url: 'https://boards.greenhouse.io/acme/jobs/Some_Role_12345' }),
+      workdayDedupKey({ url: 'https://evilmyworkdayjobs.com/job/Remote/Staff_JR1' }), // suffix without the leading dot
+    ];
+    if (spoofed.every(k => k === null)) {
+      pass('workdayDedupKey() rejects a non-Workday host even when the last path segment contains an underscore');
+    } else {
+      fail(`workdayDedupKey() should reject non-Workday hosts regardless of path shape: ${JSON.stringify(spoofed)}`);
     }
   }
 
