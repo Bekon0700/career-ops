@@ -12,7 +12,7 @@ import { pass, fail, ROOT } from './helpers.mjs';
 console.log('\nscan-ats-full — dedupTokenFor (#3439)');
 
 const mod = await import(pathToFileURL(join(ROOT, 'scan-ats-full.mjs')).href);
-const { dedupTokenFor, SOURCES } = mod;
+const { dedupTokenFor, SOURCES, providerForSource } = mod;
 const workdayModule = await import(pathToFileURL(join(ROOT, 'providers/workday.mjs')).href);
 
 const workdaySiteA = { url: 'https://acme.wd5.myworkdayjobs.com/External/job/Remote/Staff-Engineer_JR00123' };
@@ -91,4 +91,52 @@ if (SOURCES.workday.provider === workdayModule.default) {
   pass('SOURCES.workday.provider is the same module workdayDedupKey lives on');
 } else {
   fail('SOURCES.workday.provider does not match providers/workday.mjs\'s default export');
+}
+
+// A historical (already-recorded) Workday offer must dedupe against a FRESH
+// job for the same requisition served under a different site — not just two
+// offers discovered in the same run. Without loadSeenUrls' extraTokensFor
+// hook, a requisition first seen last run under site A's URL would look
+// "new" again the moment site B is the only one still listing it, since
+// scan-history.tsv records the URL it was first seen on and
+// normalizeUrlForDedup never equates two different sites' URLs.
+{
+  const { collectSeenUrls } = await import(pathToFileURL(join(ROOT, 'scan.mjs')).href);
+
+  // A legacy scan-history.tsv row: this requisition was recorded under
+  // site A ("External") on a previous run, tagged with the portal/source
+  // scan-ats-full.mjs actually writes (offer.source, "{ats}-full").
+  const scanHistoryText = [
+    'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\tlocation',
+    `${workdaySiteA.url}\t2020-01-01\tworkday-full\tStaff Engineer\tAcme\tadded\tRemote`,
+    '',
+  ].join('\n');
+
+  const { seen } = collectSeenUrls({ scanHistoryText }, {}, {
+    extraTokensFor: (url, portal) => providerForSource(portal)?.dedupKey?.({ url }),
+  });
+
+  // Site B publishes the same requisition on THIS run.
+  const freshToken = dedupTokenFor(workdaySiteB, workdayModule.default);
+  if (seen.has(freshToken)) {
+    pass('a legacy Workday history row dedupes a fresh same-requisition offer from a different site');
+  } else {
+    fail(`legacy history row did not cover the fresh cross-site token: ${JSON.stringify({ seen: [...seen], freshToken })}`);
+  }
+}
+
+// providerForSource resolves both the "-full" main-sweep suffix and a bare
+// SOURCES key, and returns undefined (not throw) for a seed offer's
+// "{seedId}-seed" source, which SOURCES intentionally has no entry for.
+{
+  if (providerForSource('workday-full') === workdayModule.default) {
+    pass('providerForSource resolves the "-full" suffix to the registered provider');
+  } else {
+    fail('providerForSource did not resolve "workday-full" to providers/workday.mjs');
+  }
+  if (providerForSource('some-seed-id-seed') === undefined) {
+    pass('providerForSource returns undefined for a seed-pass source, not a throw');
+  } else {
+    fail('providerForSource unexpectedly resolved a seed-pass source to a provider');
+  }
 }

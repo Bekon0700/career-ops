@@ -451,6 +451,16 @@ export function dedupTokenFor(job, provider) {
   return provider?.dedupKey?.(job) || normalizeUrlForDedup(job.url);
 }
 
+// Resolve an offer's provider from its recorded `source` string — shared by
+// the checkpoint-resume reseed below and by loadSeenUrls' extraTokensFor
+// hook. `source` is "{sourcesKey}-full" for the main sweep and
+// "{seedId}-seed" for seed offers; SOURCES has no seed entries, so a seed
+// offer's lookup misses and callers fall back to URL-only dedup, unchanged
+// from before #3439.
+export function providerForSource(source) {
+  return SOURCES[String(source || '').replace(/-full$/, '')]?.provider;
+}
+
 // Cap-aware company sampling. Default: the dataset's natural (alphabetical)
 // prefix. With --shuffle: a random sample of `limit` companies, so a capped
 // scan isn't always biased to the same alphabetical-first slice. Pure; returns
@@ -685,7 +695,17 @@ async function main() {
   const sourcesSummary = [atsSummary, seedsSummary].filter(Boolean).join(' | ');
   log(`Reverse ATS scan — ${sourcesSummary} | since ${opts.sinceDays}d${opts.limit < Infinity ? ` | limit ${opts.limit}/ats` : ''}${opts.shuffle ? ' | shuffled' : ''}${opts.includeUndated ? ' | +undated' : ''}${opts.liveness ? ' | liveness' : ''}${opts.dryRun ? ' | DRY RUN' : ''}`);
 
-  const { seen: seenUrls } = loadSeenUrls();
+  // extraTokensFor: a historical scan-history.tsv row records the URL it was
+  // FIRST seen on, so without this a Workday requisition seen last run under
+  // site A's URL wouldn't be recognized when this run only sees it under
+  // site B — the plain normalizeUrlForDedup comparison never matches across
+  // sites, and only fresh-run offers were reseeded with the provider key
+  // (#3439). `portal` here is scan-history.tsv's recorded `offer.source`, so
+  // providerForSource resolves it the same way the checkpoint reseed above
+  // does.
+  const { seen: seenUrls } = loadSeenUrls({}, {
+    extraTokensFor: (url, portal) => providerForSource(portal)?.dedupKey?.({ url }),
+  });
   const blacklist = loadBlacklist();
   // sinceMs and includeUndated let providers (currently only workday.mjs)
   // stop paginating a tenant early instead of always walking to max_pages:
@@ -722,8 +742,7 @@ async function main() {
   // so a seed offer's lookup misses and falls back to URL — its unchanged,
   // pre-#3439 behavior.
   for (const o of newOffers) {
-    const provider = SOURCES[String(o.source || '').replace(/-full$/, '')]?.provider;
-    seenUrls.add(dedupTokenFor(o, provider));
+    seenUrls.add(dedupTokenFor(o, providerForSource(o.source)));
   }
   const completedSources = new Set(checkpoint?.completedSources || []);
   const cc = checkpoint?.counters || {};
