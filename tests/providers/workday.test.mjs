@@ -107,6 +107,77 @@ try {
     }
   }
 
+  // #3446 review (ronanime-arch): the trailing-"-N" strip must fire ONLY when
+  // what precedes the hyphen is requisition-ID-shaped on its own (leading
+  // digit, 2+ trailing digits, underscores allowed between). Otherwise the
+  // hyphen-digits ARE the whole requisition ID and collapsing them merges every
+  // distinct posting at that tenant into one key. Fixtures below are
+  // ronanime's validated live cache.
+  {
+    const wd = (tail) =>
+      workdayDedupKey({ url: `https://acme.wd5.myworkdayjobs.com/careers/job/City/Some-Role_${tail}` });
+    const keyOf = (tail) => `workday:acme.wd5.myworkdayjobs.com:${tail.toLowerCase()}`;
+
+    // Two distinct R-NNNNNNN reqs at one tenant must NOT collapse.
+    if (wd('R-2593225') && wd('R-2592964') && wd('R-2593225') !== wd('R-2592964')) {
+      pass('workdayDedupKey() keeps two distinct R-NNNNNNN reqs apart (Walmart R-2593225 vs R-2592964)');
+    } else {
+      fail(`workdayDedupKey() collapsed distinct R-NNNNNNN reqs: ${wd('R-2593225')} vs ${wd('R-2592964')}`);
+    }
+
+    // Two distinct JR26-NNNNN reqs must NOT collapse.
+    if (wd('JR26-39350') && wd('JR26-42996') && wd('JR26-39350') !== wd('JR26-42996')) {
+      pass('workdayDedupKey() keeps two distinct JR26-NNNNN reqs apart (JR26-39350 vs JR26-42996)');
+    } else {
+      fail(`workdayDedupKey() collapsed distinct JR26-NNNNN reqs: ${wd('JR26-39350')} vs ${wd('JR26-42996')}`);
+    }
+
+    // Regression-lock: each of these hyphen tails is the requisition ID itself
+    // and must be left intact (no "-N" stripped).
+    const mustNotStrip = ['R-058589', 'R-101976', 'R-4253', 'R-103502',
+      'R2026-00707', 'R2026-01237', 'R2026-01334', 'R2026-01355'];
+    const wronglyStripped = mustNotStrip.filter((t) => wd(t) !== keyOf(t));
+    if (wronglyStripped.length === 0) {
+      pass('workdayDedupKey() leaves a non-req-shaped hyphen tail intact (Red Hat, XPEL, Lytx, Job Duck, R2026 quad)');
+    } else {
+      fail(`workdayDedupKey() wrongly altered: ${wronglyStripped.join(', ')}`);
+    }
+
+    // The R2026-NNNNN quad must be four distinct keys.
+    const quad = new Set(['R2026-00707', 'R2026-01237', 'R2026-01334', 'R2026-01355'].map(wd));
+    if (quad.size === 4) {
+      pass('workdayDedupKey() keeps the four R2026-NNNNN siblings distinct from each other');
+    } else {
+      fail(`workdayDedupKey() collapsed the R2026 quad to ${quad.size} key(s)`);
+    }
+
+    // Regression-lock the other half: a real disambiguator on a req-shaped base
+    // must STILL be stripped so the cross-site copies collapse to one key.
+    const mustCollapse = [
+      ['R11312', ['R11312-2', 'R11312-3']],
+      ['R260022205', ['R260022205-2']],
+      ['R26007842', ['R26007842-1']],
+      ['R266069', ['R266069-1']],
+      ['R53113', ['R53113-2']],
+      ['JR1126610', ['JR1126610-1']],
+      ['R2000678390', ['R2000678390-1']],
+    ];
+    const notCollapsed = mustCollapse.filter(([base, variants]) => variants.some((v) => wd(v) !== wd(base)));
+    if (notCollapsed.length === 0) {
+      pass('workdayDedupKey() still strips a real disambiguator off a req-shaped base (R11312/-2/-3, R260022205-2, R26007842-1, R266069-1, R53113-2, JR1126610-1, R2000678390-1)');
+    } else {
+      fail(`workdayDedupKey() failed to collapse: ${notCollapsed.map(([b]) => b).join(', ')}`);
+    }
+
+    // R26_05710 splits on "_" not "-": the guard allows underscores in the
+    // req-ID base, so the multi-underscore ID survives and the "-1" is dropped.
+    if (wd('R26_05710-1') === keyOf('R26_05710') && wd('R26_05710') === keyOf('R26_05710')) {
+      pass('workdayDedupKey() guard permits underscores in the req-ID base (R26_05710-1 → r26_05710, unchanged)');
+    } else {
+      fail(`workdayDedupKey() mishandled the underscore base: ${wd('R26_05710-1')} / ${wd('R26_05710')}`);
+    }
+  }
+
   // Two different tenants reusing the same bare requisition number must not
   // collapse — direct coverage of ronanime-arch's tenant-scoping case
   // (already covered above by the JR00123 tenant/instance fixtures; kept as

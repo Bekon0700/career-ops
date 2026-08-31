@@ -277,7 +277,14 @@ export function workdayDedupKey(job) {
   if (!lastSegment) return null;
   const underscoreIdx = lastSegment.indexOf('_');
   if (underscoreIdx === -1) return null; // no title/requisition-ID separator — nothing to key on
-  const reqId = lastSegment.slice(underscoreIdx + 1).toLowerCase().replace(/-\d+$/, '');
+  const raw = lastSegment.slice(underscoreIdx + 1).toLowerCase();
+  // Only treat a trailing "-N" as Workday's cross-site disambiguator when what
+  // precedes it is already requisition-ID-shaped on its own (a leading digit,
+  // 2+ trailing digits, underscores allowed in between) — otherwise the hyphen
+  // digits ARE the requisition ID and must be kept, e.g. Walmart's "R-2593225"
+  // (credit: ronanime-arch, PR #3446).
+  const m = raw.match(/^(.*?)-(\d{1,2})$/);
+  const reqId = m && /^[a-z]*\d[a-z0-9_]*\d{2,}$/.test(m[1]) ? m[1] : raw;
   if (!reqId) return null;
   return `workday:${parsed.hostname.toLowerCase()}:${reqId}`;
 }
