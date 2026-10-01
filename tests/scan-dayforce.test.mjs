@@ -1,10 +1,11 @@
 // Fixture-based unit tests for the pure logic in scan-dayforce.mjs — input
 // validation, URL building/host-pinning, pagination math, location joining,
-// and JD header/body/footer concatenation.
+// and JD header/body/footer concatenation — plus challenge detection and the
+// retry decision, against stubbed pages and a stubbed browser launch.
 //
-// What this suite does NOT cover: the Playwright-driven parts (page.goto
+// What this suite does NOT cover: the real Playwright-driven parts (page.goto
 // bootstrapping Cloudflare cookies, page.request riding that session, the
-// actual browser lifecycle, retry-after-403 behavior). Mocking Playwright's
+// actual browser lifecycle). Mocking Playwright's
 // APIRequestContext convincingly enough to exercise scanBoard()/main() would
 // mostly test the mock, not the scanner — those paths are exercised by the
 // live smoke test instead (see the task report, not this file).
@@ -29,6 +30,9 @@ import {
   buildJobDescriptionText,
   parseArgs,
   scanBoard,
+  scanBoardWithRetry,
+  detectChallenge,
+  DayforceChallengeError,
   ALLOWED_HOST,
 } from '../scan-dayforce.mjs';
 
@@ -124,6 +128,8 @@ test('scanBoard applies all list-level description gates before detail fetch and
   const page = {
     goto: async () => {},
     url: () => 'https://jobs.dayforcehcm.com/en-US/tenant/CANDIDATEPORTAL',
+    title: async () => 'Careers',
+    locator: () => ({ count: async () => 0 }),
     request: {
       post: async (url, options) => {
         assert.strictEqual(options.maxRedirects, 0);
@@ -158,6 +164,107 @@ test('scanBoard applies all list-level description gates before detail fetch and
   assert.strictEqual(result.contentSkipped.length, 1);
   assert.strictEqual(result.countryEligibilitySkipped.length, 1);
   assert.strictEqual(result.visaSkipped.length, 1);
+});
+
+// ── Interactive challenge (No bypass, #4675) ─────────────────────────
+
+const BOARD = { name: 'Human Company', tenant: 'tenant', board: 'CANDIDATEPORTAL', culture: 'en-US', jobBoardId: '1' };
+
+/**
+ * Stub page whose board URL settles on `title` with `selectors` present.
+ * Records every API request so a test can assert none were made.
+ */
+function stubPage({ title = 'Careers', selectors = [], searchStatus = 200 } = {}) {
+  const requests = [];
+  const response = (json, status = 200) => ({
+    ok: () => status >= 200 && status < 300,
+    status: () => status,
+    json: async () => json,
+  });
+  return {
+    requests,
+    goto: async () => response(null),
+    url: () => 'https://jobs.dayforcehcm.com/en-US/tenant/CANDIDATEPORTAL',
+    title: async () => title,
+    locator: (selector) => ({ count: async () => (selectors.includes(selector) ? 1 : 0) }),
+    request: {
+      get: async (url) => {
+        requests.push(['GET', url]);
+        return response({ csrfToken: 'token' });
+      },
+      post: async (url) => {
+        requests.push(['POST', url]);
+        return response({ jobPostings: [], offset: 0, count: 0, maxCount: 0 }, searchStatus);
+      },
+    },
+  };
+}
+
+/** Fake chromium.launch() that hands out `pages` in order and counts launches. */
+function stubLaunch(pages) {
+  const launch = async () => {
+    launch.count++;
+    const page = pages[Math.min(launch.count - 1, pages.length - 1)];
+    return {
+      newContext: async () => ({ newPage: async () => page, close: async () => {} }),
+      close: async () => {},
+    };
+  };
+  launch.count = 0;
+  return launch;
+}
+
+test('detectChallenge — flags challenge titles and widgets, passes a normal board', async () => {
+  assert.strictEqual(await detectChallenge(stubPage()), null);
+  assert.match(await detectChallenge(stubPage({ title: 'Just a moment...' })), /title "Just a moment\.\.\."/);
+  assert.match(await detectChallenge(stubPage({ title: 'Attention Required! | Cloudflare' })), /title/);
+  assert.match(
+    await detectChallenge(stubPage({ selectors: ['iframe[src*="challenges.cloudflare.com"]'] })),
+    /element iframe\[src\*="challenges\.cloudflare\.com"\]/,
+  );
+  assert.match(await detectChallenge(stubPage({ selectors: ['.cf-turnstile'] })), /\.cf-turnstile/);
+});
+
+test('scanBoard throws DayforceChallengeError on a challenge page and makes no API request', async () => {
+  const page = stubPage({ title: 'Just a moment...', selectors: ['#challenge-form'] });
+  await assert.rejects(
+    () => scanBoard(page, BOARD),
+    (err) => {
+      assert.ok(err instanceof DayforceChallengeError);
+      assert.strictEqual(err.name, 'DayforceChallengeError');
+      assert.strictEqual(err.retriable, false);
+      assert.strictEqual(err.tenant, 'tenant');
+      assert.match(err.message, /tenant\/CANDIDATEPORTAL is behind an interactive challenge/);
+      assert.match(err.message, /skipped, not retried/);
+      return true;
+    },
+  );
+  assert.deepStrictEqual(page.requests, [], 'never touches the CSRF/search API behind a challenge');
+});
+
+test('scanBoardWithRetry — a challenge is reported once and never retried', async () => {
+  const launch = stubLaunch([stubPage({ title: 'Just a moment...' })]);
+  const { result, error } = await scanBoardWithRetry(BOARD, {}, { launch, retryDelayMs: 0 });
+  assert.strictEqual(result, null);
+  assert.ok(error instanceof DayforceChallengeError);
+  assert.strictEqual(launch.count, 1);
+});
+
+test('scanBoardWithRetry — a plain 403 still gets one fresh-session retry', async () => {
+  const launch = stubLaunch([stubPage({ searchStatus: 403 }), stubPage()]);
+  const { result, error } = await scanBoardWithRetry(BOARD, {}, { launch, retryDelayMs: 0 });
+  assert.strictEqual(error, null);
+  assert.strictEqual(result.totalFound, 0);
+  assert.strictEqual(launch.count, 2);
+});
+
+test('scanBoardWithRetry — a 403 on both attempts surfaces the generic error, not a challenge', async () => {
+  const launch = stubLaunch([stubPage({ searchStatus: 403 })]);
+  const { result, error } = await scanBoardWithRetry(BOARD, {}, { launch, retryDelayMs: 0 });
+  assert.strictEqual(result, null);
+  assert.ok(!(error instanceof DayforceChallengeError));
+  assert.match(error.message, /search HTTP 403/);
+  assert.strictEqual(launch.count, 2);
 });
 
 test('assertDayforceUrl — pins to https://jobs.dayforcehcm.com exactly', () => {
