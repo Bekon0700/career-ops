@@ -171,10 +171,12 @@ test('scanBoard applies all list-level description gates before detail fetch and
 const BOARD = { name: 'Human Company', tenant: 'tenant', board: 'CANDIDATEPORTAL', culture: 'en-US', jobBoardId: '1' };
 
 /**
- * Stub page whose board URL settles on `title` with `selectors` present.
+ * Stub page whose board URL settles on `title`, with `selectors` present as
+ * plain elements and `widgets` as { selector: [{ visible, token }] } — a
+ * captcha widget's visibility and the answer it has filled in, if any.
  * Records every API request so a test can assert none were made.
  */
-function stubPage({ title = 'Careers', selectors = [], searchStatus = 200 } = {}) {
+function stubPage({ title = 'Careers', selectors = [], widgets = {}, searchStatus = 200 } = {}) {
   const requests = [];
   const response = (json, status = 200) => ({
     ok: () => status >= 200 && status < 300,
@@ -186,7 +188,16 @@ function stubPage({ title = 'Careers', selectors = [], searchStatus = 200 } = {}
     goto: async () => response(null),
     url: () => 'https://jobs.dayforcehcm.com/en-US/tenant/CANDIDATEPORTAL',
     title: async () => title,
-    locator: (selector) => ({ count: async () => (selectors.includes(selector) ? 1 : 0) }),
+    locator: (selector) => {
+      const items = widgets[selector] ?? (selectors.includes(selector) ? [{ visible: true, token: '' }] : []);
+      return {
+        count: async () => items.length,
+        nth: (i) => ({
+          isVisible: async () => items[i].visible,
+          evaluate: async () => items[i].token,
+        }),
+      };
+    },
     request: {
       get: async (url) => {
         requests.push(['GET', url]);
@@ -214,15 +225,46 @@ function stubLaunch(pages) {
   return launch;
 }
 
-test('detectChallenge — flags challenge titles and widgets, passes a normal board', async () => {
+test('detectChallenge — flags challenge titles and interstitial markup, passes a normal board', async () => {
   assert.strictEqual(await detectChallenge(stubPage()), null);
   assert.match(await detectChallenge(stubPage({ title: 'Just a moment...' })), /title "Just a moment\.\.\."/);
   assert.match(await detectChallenge(stubPage({ title: 'Attention Required! | Cloudflare' })), /title/);
+  assert.match(await detectChallenge(stubPage({ selectors: ['#challenge-form'] })), /element #challenge-form/);
+  assert.match(await detectChallenge(stubPage({ selectors: ['#challenge-stage'] })), /element #challenge-stage/);
+});
+
+test('detectChallenge — an embedded widget counts only while visible and unsolved', async () => {
+  // Visible and waiting for an answer: that blocks the page.
   assert.match(
-    await detectChallenge(stubPage({ selectors: ['iframe[src*="challenges.cloudflare.com"]'] })),
-    /element iframe\[src\*="challenges\.cloudflare\.com"\]/,
+    await detectChallenge(stubPage({ widgets: { '.cf-turnstile': [{ visible: true, token: '' }] } })),
+    /unsolved \.cf-turnstile widget/,
   );
-  assert.match(await detectChallenge(stubPage({ selectors: ['.cf-turnstile'] })), /\.cf-turnstile/);
+  assert.match(
+    await detectChallenge(stubPage({ widgets: { '.h-captcha': [{ visible: true, token: '' }] } })),
+    /unsolved \.h-captcha widget/,
+  );
+  // Invisible / non-interactive Turnstile: not a challenge.
+  assert.strictEqual(
+    await detectChallenge(stubPage({ widgets: { '.cf-turnstile': [{ visible: false, token: '' }] } })),
+    null,
+  );
+  // Already solved — the widget stays on the page with its token filled in.
+  assert.strictEqual(
+    await detectChallenge(stubPage({ widgets: { '.cf-turnstile': [{ visible: true, token: '0.abc123' }] } })),
+    null,
+  );
+  assert.strictEqual(
+    await detectChallenge(stubPage({ widgets: { '.h-captcha': [{ visible: true, token: 'P1_abc' }] } })),
+    null,
+  );
+  // One solved widget doesn't hide a second, unsolved one.
+  assert.match(
+    await detectChallenge(stubPage({ widgets: { '.cf-turnstile': [
+      { visible: true, token: '0.abc123' },
+      { visible: true, token: '' },
+    ] } })),
+    /unsolved \.cf-turnstile widget/,
+  );
 });
 
 test('scanBoard throws DayforceChallengeError on a challenge page and makes no API request', async () => {
@@ -279,6 +321,31 @@ test('scanBoardWithRetry — a 403 on both attempts surfaces the generic error, 
   assert.ok(!(error instanceof DayforceChallengeError));
   assert.match(error.message, /search HTTP 403/);
   assert.strictEqual(launch.count, 2);
+});
+
+test('scanBoardWithRetry — a browser startup failure is returned for the board, not thrown', async () => {
+  const boom = new Error('browserType.launch: Executable does not exist');
+  const { result, error } = await scanBoardWithRetry(BOARD, {}, {
+    launch: async () => { throw boom; },
+    retryDelayMs: 0,
+  });
+  assert.strictEqual(result, null);
+  assert.strictEqual(error, boom);
+});
+
+test('scanBoardWithRetry — closes the browser it opened when context setup fails', async () => {
+  const boom = new Error('newContext failed');
+  let browserClosed = false;
+  const { result, error } = await scanBoardWithRetry(BOARD, {}, {
+    launch: async () => ({
+      newContext: async () => { throw boom; },
+      close: async () => { browserClosed = true; },
+    }),
+    retryDelayMs: 0,
+  });
+  assert.strictEqual(result, null);
+  assert.strictEqual(error, boom, 'the original error is kept');
+  assert.strictEqual(browserClosed, true);
 });
 
 test('assertDayforceUrl — pins to https://jobs.dayforcehcm.com exactly', () => {

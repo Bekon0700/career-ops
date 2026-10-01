@@ -109,13 +109,15 @@ const CULTURE_RE = /^[a-z]{2}-[A-Z]{2}$/;
 const JOB_BOARD_ID_RE = /^\d+$/;
 const JOB_POSTING_ID_RE = /^\d+$/;
 
-// Widgets that are only on the page while a challenge waits for a human.
-const CHALLENGE_SELECTORS = [
-  'iframe[src*="challenges.cloudflare.com"]',
-  '#challenge-form',
-  '#challenge-stage',
-  '.cf-turnstile',
-  'iframe[src*="hcaptcha.com"]',
+// Markup that only exists on Cloudflare's own interstitial challenge page.
+const INTERSTITIAL_SELECTORS = ['#challenge-form', '#challenge-stage'];
+
+// Widgets a normal page can embed, with the field each one fills in once
+// solved. A widget only blocks while it's visible and that field is empty:
+// invisible/non-interactive Turnstile, or one already completed, does not.
+const CHALLENGE_WIDGETS = [
+  { selector: '.cf-turnstile', response: 'cf-turnstile-response' },
+  { selector: '.h-captcha', response: 'h-captcha-response' },
 ];
 
 // ── Challenge detection ──────────────────────────────────────────────
@@ -147,9 +149,21 @@ export class DayforceChallengeError extends Error {
 export async function detectChallenge(page) {
   const title = await page.title().catch(() => '');
   if (BOT_CHALLENGE_PATTERNS.some(re => re.test(title))) return `title "${title}"`;
-  for (const selector of CHALLENGE_SELECTORS) {
+  for (const selector of INTERSTITIAL_SELECTORS) {
     const count = await page.locator(selector).count().catch(() => 0);
     if (count > 0) return `element ${selector}`;
+  }
+  for (const { selector, response } of CHALLENGE_WIDGETS) {
+    const widgets = page.locator(selector);
+    const count = await widgets.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      const widget = widgets.nth(i);
+      if (!(await widget.isVisible().catch(() => false))) continue;
+      const token = await widget
+        .evaluate((el, name) => el.querySelector(`[name="${name}"]`)?.value ?? '', response)
+        .catch(() => '');
+      if (!token) return `unsolved ${selector} widget`;
+    }
   }
   return null;
 }
@@ -582,10 +596,14 @@ export async function scanBoardWithRetry(boardCfg, filters, {
 } = {}) {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const browser = await launch();
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    // Browser startup sits inside the try so a launch failure is reported
+    // for this board like any other error, instead of aborting the whole scan.
+    let browser = null;
+    let context = null;
     try {
+      browser = await launch();
+      context = await browser.newContext();
+      const page = await context.newPage();
       return { result: await scanBoard(page, boardCfg, filters, { debug }), error: null };
     } catch (err) {
       lastError = err;
@@ -594,8 +612,9 @@ export async function scanBoardWithRetry(boardCfg, filters, {
       if (debug) console.log(`\n  [debug] ${boardCfg.tenant}: ${err.message} — re-bootstrapping session and retrying once`);
       await new Promise(r => setTimeout(r, retryDelayMs));
     } finally {
-      await context.close();
-      await browser.close();
+      // Close only what was opened; a failing close must not hide the real error.
+      await context?.close().catch(() => {});
+      await browser?.close().catch(() => {});
     }
   }
   return { result: null, error: lastError };
