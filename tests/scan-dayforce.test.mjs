@@ -242,6 +242,20 @@ test('scanBoard throws DayforceChallengeError on a challenge page and makes no A
   assert.deepStrictEqual(page.requests, [], 'never touches the CSRF/search API behind a challenge');
 });
 
+test('scanBoard reports a challenge even when goto times out waiting for networkidle', async () => {
+  // A real challenge page keeps polling, so networkidle never fires.
+  const timeout = new Error('page.goto: Timeout 30000ms exceeded.');
+  const page = stubPage({ title: 'Just a moment...' });
+  page.goto = async () => { throw timeout; };
+  await assert.rejects(() => scanBoard(page, BOARD), DayforceChallengeError);
+  assert.deepStrictEqual(page.requests, []);
+
+  // A timeout on a page that is not a challenge keeps its original error.
+  const plain = stubPage();
+  plain.goto = async () => { throw timeout; };
+  await assert.rejects(() => scanBoard(plain, BOARD), (err) => err === timeout);
+});
+
 test('scanBoardWithRetry — a challenge is reported once and never retried', async () => {
   const launch = stubLaunch([stubPage({ title: 'Just a moment...' })]);
   const { result, error } = await scanBoardWithRetry(BOARD, {}, { launch, retryDelayMs: 0 });

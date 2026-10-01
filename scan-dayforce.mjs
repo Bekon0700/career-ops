@@ -121,7 +121,8 @@ const CHALLENGE_SELECTORS = [
 // ── Challenge detection ──────────────────────────────────────────────
 
 /**
- * The board answered with an interactive challenge instead of its listings.
+ * The board answered with an interactive challenge instead of its listings,
+ * whether goto() settled on it or timed out on it.
  * Never retriable: a fresh session would just meet the same wall, and working
  * around it is exactly what the "No bypass" rule forbids.
  */
@@ -458,7 +459,16 @@ export async function scanBoard(page, boardCfg, filters = {}, { debug = false } 
   const found = [];
   const boardUrl = buildBoardUrl(boardCfg.culture, boardCfg.tenant, boardCfg.board);
 
-  await page.goto(boardUrl, { waitUntil: 'networkidle', timeout: 30000 });
+  try {
+    await page.goto(boardUrl, { waitUntil: 'networkidle', timeout: 30000 });
+  } catch (err) {
+    // A live challenge page keeps polling Cloudflare, so the network never
+    // goes idle and goto times out (seen on real "Just a moment..." and
+    // Turnstile pages). Look at what's on screen before reporting the timeout.
+    const challenge = await detectChallenge(page);
+    if (challenge) throw new DayforceChallengeError(boardCfg.tenant, boardCfg.board, challenge);
+    throw err;
+  }
 
   if (debug) {
     const debugDir = join(DATA_ROOT, 'output');
